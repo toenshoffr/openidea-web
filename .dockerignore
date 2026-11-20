@@ -1,0 +1,9 @@
+target
+node_modules
+dist
+.git
+docs
+e2e
+evals
+perf
+smoke
