@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { commands, isTauri, type WindowButtonLayout } from "@/platform/ipc";
+import { isWebHost } from "@/platform/web/host";
 
 interface PlatformInfo {
   /** `macos` | `windows` | `linux` | `web`. */
@@ -16,7 +17,10 @@ interface PlatformInfo {
   windowButtons: WindowButtonLayout;
 }
 
-const DEFAULT_WINDOW_BUTTONS: WindowButtonLayout = { left: [], right: ["minimize", "maximize", "close"] };
+const DEFAULT_WINDOW_BUTTONS: WindowButtonLayout = {
+  left: [],
+  right: ["minimize", "maximize", "close"],
+};
 
 /** OS from the user agent (before the backend answers, or in a browser). "darwin" must not read as Windows. */
 export function guessOs(): "macos" | "windows" | "linux" | "web" {
@@ -34,8 +38,8 @@ export const usePlatform = create<PlatformInfo>(() => {
     os,
     version: null,
     windowsBuildNumber: null,
-    overlayTitleBar: isTauri() && os === "macos",
-    framelessTitleBar: isTauri() && (os === "windows" || os === "linux"),
+    overlayTitleBar: isTauri() && !isWebHost() && os === "macos",
+    framelessTitleBar: isTauri() && !isWebHost() && (os === "windows" || os === "linux"),
     wayland: false,
     windowButtons: DEFAULT_WINDOW_BUTTONS,
   };
@@ -57,8 +61,8 @@ export async function loadPlatformInfo() {
       os: info.platform,
       version: info.version,
       windowsBuildNumber: info.windowsBuildNumber,
-      overlayTitleBar: info.platform === "macos",
-      framelessTitleBar: info.platform === "windows" || info.platform === "linux",
+      overlayTitleBar: !isWebHost() && info.platform === "macos",
+      framelessTitleBar: !isWebHost() && (info.platform === "windows" || info.platform === "linux"),
       wayland: info.wayland,
       windowButtons: info.windowButtons ?? DEFAULT_WINDOW_BUTTONS,
     });

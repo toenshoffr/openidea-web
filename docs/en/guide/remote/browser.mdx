@@ -1,0 +1,73 @@
+---
+title: "OpenIDEA in the browser"
+description: "Run openidea-server --listen in a container or workspace and use OpenIDEA from a web browser, with no desktop app on your machine."
+---
+
+`openidea-server --listen` serves the OpenIDEA workbench to a web browser. The project, its language servers, terminals,
+runs and Git all live where the server runs (a container, a cloud workspace, a remote machine); the browser only shows the
+UI. Use it where you cannot install the desktop app, for example in a workspace platform that exposes a web IDE on a port.
+
+<Warning>This is an early version. Read [Limitations](#limitations) before you rely on it.</Warning>
+
+## Start it
+
+Build the frontend once, then start the server next to your project:
+
+```bash
+pnpm build:web
+openidea-server --listen 0.0.0.0:8080 --project /workspace/my-app --web-root dist
+```
+
+The server prints a URL with an access token:
+
+```text
+OpenIDEA is ready: http://0.0.0.0:8080/?token=3f9c…
+```
+
+Open it once. The server sets a cookie and removes the token from the address bar.
+
+| Option                     | Meaning                                                                                                            |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `--listen [<host>:]<port>` | Where to listen. A bare port listens on `127.0.0.1` only; use `0.0.0.0:<port>` to accept connections from outside. |
+| `--project <path>`         | The folder every new browser tab opens. The server trusts it, so there is no trust prompt for it.                  |
+| `--web-root <dir>`         | The built frontend. Defaults to `$OPENIDEA_WEB_ROOT`, a `web/` folder beside the binary, or `./dist`.              |
+| `--token <secret>`         | Use this access token instead of a random one (or set `OPENIDEA_TOKEN`).                                           |
+| `--no-auth`                | No token. Only when something in front of the server already authenticates users.                                  |
+
+## Security
+
+The server can run any command as its user (terminals, run configurations). Treat access to its port like a shell.
+
+- Access needs the token by default. Compare it to an SSH key, not to a password you reuse.
+- Every WebSocket must come from the page's own origin (`Origin` equal to `Host` or `X-Forwarded-Host`), so another page in
+  the same browser cannot use your session.
+- The server speaks plain HTTP. Put it behind TLS (a workspace proxy, a reverse proxy) before exposing it beyond a trusted network.
+- With `--no-auth`, anyone who can reach the port can run code as the server's user.
+
+## Behind a proxy
+
+The page and its socket use relative URLs, so the IDE works under a path prefix such as
+`https://lab.example.com/user/project/proxy/8080/`, as long as the proxy forwards WebSocket upgrades and keeps the
+trailing slash. The server sends a WebSocket ping every 20 seconds so idle-timeouts do not close the connection.
+
+## Dev container
+
+```json title=".devcontainer/devcontainer.json"
+{
+  "forwardPorts": [8080],
+  "postStartCommand": "openidea-server --listen 0.0.0.0:8080 --project ${containerWorkspaceFolder} --token \"$OPENIDEA_TOKEN\" &"
+}
+```
+
+Set `OPENIDEA_TOKEN` as a secret of the workspace so the URL stays stable between restarts.
+
+## Limitations
+
+- **A tab is a session.** Each browser tab starts its own backend. Reloading the page or losing the connection ends its
+  terminals, runs and debug sessions; the project and its files are unaffected.
+- **One window.** Settings, diff, comparison and editor windows are separate windows in the desktop app and do not open yet.
+- **Server-side commands only.** The desktop-only features (Docker, GitHub pull requests, the HTTP client, plugin
+  management, system notifications, the clipboard beyond plain text) are not available and report that they are unavailable.
+- **Images and files from the project disk** that the desktop shows through its `asset:` protocol are not served yet.
+- **No MCP server.** The server does not start the MCP endpoint for coding agents in this mode.
+- **Open and save dialogs** browse the server's files inside the app. "Save as" is not available.

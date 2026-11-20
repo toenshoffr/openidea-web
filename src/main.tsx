@@ -1,3 +1,4 @@
+import "./platform/web/install";
 import { auxiliaryWindow } from "./platform/auxWindow";
 import { installCommonWindowBoot } from "./windowBoot";
 

@@ -14,7 +14,9 @@ import {
 } from "@tauri-apps/plugin-dialog";
 
 export type { SaveDialogOptions, DialogFilter };
+import { chooseOnHost } from "@/platform/choosePath";
 import { call, commands } from "@/platform/ipc";
+import { isWebHost } from "@/platform/web/host";
 
 let needsGtk: boolean | undefined;
 // Asked once when the module loads, so a picker only waits for the answer if it opens first.
@@ -58,12 +60,22 @@ async function gtkPick(options: {
 }
 
 export async function open<T extends OpenDialogOptions>(options: T = {} as T): Promise<OpenDialogReturn<T>> {
+  if (isWebHost()) {
+    // A browser has no native chooser for the server's files: browse them in the app.
+    const path = await chooseOnHost({
+      directory: options.directory ?? false,
+      title: options.title ?? "",
+      defaultPath: options.defaultPath,
+    });
+    return (options.multiple ? (path ? [path] : null) : path) as OpenDialogReturn<T>;
+  }
   if (needsGtk === false || !(await pluginDialogsUnavailable())) return pluginOpen(options);
   const paths = await gtkPick(options);
   return (options.multiple ? paths : (paths?.[0] ?? null)) as OpenDialogReturn<T>;
 }
 
 export async function save(options: SaveDialogOptions = {}): Promise<string | null> {
+  if (isWebHost()) return null;
   if (needsGtk === false || !(await pluginDialogsUnavailable())) return pluginSave(options);
   return (await gtkPick({ ...options, save: true }))?.[0] ?? null;
 }

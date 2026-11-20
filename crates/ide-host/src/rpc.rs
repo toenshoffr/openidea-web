@@ -155,8 +155,23 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    serve_framed(host, dispatcher, peer, reader, writer, ide_jsonrpc::Framing::ContentLength).await;
+}
+
+/// [`serve`] with the given wire framing (the browser transport sends one JSON message per line).
+pub async fn serve_framed<R, W>(
+    host: Arc<Host>,
+    dispatcher: Dispatcher,
+    peer: Arc<OnceLock<Peer>>,
+    reader: R,
+    writer: W,
+    framing: ide_jsonrpc::Framing,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let handler = Arc::new(ServerHandler { host: host.clone(), dispatcher, peer: peer.clone() });
-    let p = Peer::connect(reader, writer, handler);
+    let p = Peer::connect_framed(reader, writer, handler, framing);
     let _ = peer.set(p.clone());
     p.closed().await;
     // Reports belong to the disconnected desktop, even while the host shuts down.

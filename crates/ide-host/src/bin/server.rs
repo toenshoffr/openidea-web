@@ -1,5 +1,8 @@
 //! `openidea-server --stdio`: the IDE backend for remote development, serving
 //! one desktop client over stdin / stdout (started by the client over SSH).
+//!
+//! `openidea-server --listen <addr>` serves the IDE to web browsers instead: the built frontend and
+//! one WebSocket session per tab (see `ide_host::web`).
 
 use ide_host::catalogue::TrustClass;
 use ide_host::plugins::remote::{RemotePluginLanguages, SYNC_COMMAND};
@@ -35,9 +38,17 @@ fn main() {
         };
         std::process::exit(code);
     }
-    if !args.iter().any(|a| a == "--stdio") {
+    let web = match web_options(&args) {
+        Ok(web) => web,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    if web.is_none() && !args.iter().any(|a| a == "--stdio") {
         eprintln!(
-            "usage: openidea-server --stdio | --mcp-stdio [--project <path>] | --connect <host> <port> | --version"
+            "usage: openidea-server --stdio | --mcp-stdio [--project <path>] | --connect <host> <port> | --version\n       \
+             openidea-server --listen [<host>:]<port> [--project <path>] [--web-root <dir>] [--token <secret> | --no-auth]"
         );
         std::process::exit(2);
     }
@@ -49,14 +60,170 @@ fn main() {
     let base = server_home();
     // An SSH exec channel gets a minimal environment: take the login shell's, read
     // afresh on every start, plus the IDE-managed tools. Before any other thread starts.
-    ide_host::shell_env::inherit_login_shell_env("openidea-server");
+    // A server started by hand in a workspace already has the environment its user wants.
+    if web.is_none() {
+        ide_host::shell_env::inherit_login_shell_env("openidea-server");
+    }
     let data_dir = base.join("data");
     ide_tools::extend_process_path(&data_dir);
     ide_dap::adapter::set_tools_root(ide_tools::tools_dir(&data_dir));
     ide_sdk::java::add_jdk_root(&ide_tools::jdk::jdks_dir(&data_dir));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let code = runtime.block_on(run(base));
+    let code = match web {
+        Some(web) => runtime.block_on(run_web(base, web)),
+        None => runtime.block_on(run(base)),
+    };
     std::process::exit(code);
+}
+
+struct WebOptions {
+    addr: String,
+    project: Option<PathBuf>,
+    web_root: PathBuf,
+    token: Option<String>,
+}
+
+fn option_value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
+    match args.iter().position(|a| a == name) {
+        None => Ok(None),
+        Some(i) => args.get(i + 1).map(|v| Some(v.as_str())).ok_or_else(|| format!("{name} needs a value")),
+    }
+}
+
+/// `--listen` and what goes with it; `None` when the server is not asked to listen.
+fn web_options(args: &[String]) -> Result<Option<WebOptions>, String> {
+    let Some(listen) = option_value(args, "--listen")? else { return Ok(None) };
+    // A bare port stays on this machine: exposing the IDE is the operator's explicit choice.
+    let addr = if listen.contains(':') { listen.to_owned() } else { format!("127.0.0.1:{listen}") };
+    let project = option_value(args, "--project")?.map(PathBuf::from);
+    let web_root = option_value(args, "--web-root")?
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("OPENIDEA_WEB_ROOT").map(PathBuf::from))
+        .or_else(|| {
+            let beside = std::env::current_exe().ok()?.parent()?.join("web");
+            beside.join("index.html").is_file().then_some(beside)
+        })
+        .unwrap_or_else(|| PathBuf::from("dist"));
+    if !web_root.join("index.html").is_file() {
+        return Err(format!(
+            "no frontend in {} (build it with `pnpm build`, or pass --web-root <dir>)",
+            web_root.display()
+        ));
+    }
+    let token = if args.iter().any(|a| a == "--no-auth") {
+        None
+    } else {
+        Some(match option_value(args, "--token")?.map(str::to_owned).or_else(|| std::env::var("OPENIDEA_TOKEN").ok()) {
+            Some(t) if !t.is_empty() => t,
+            _ => random_token().map_err(|e| format!("cannot create an access token: {e}"))?,
+        })
+    };
+    Ok(Some(WebOptions { addr, project, web_root, token }))
+}
+
+fn random_token() -> Result<String, getrandom::Error> {
+    let mut bytes = [0u8; 24];
+    getrandom::fill(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Serves browsers: one `Host` (and so one set of language servers and terminals) per open tab.
+async fn run_web(base: PathBuf, options: WebOptions) -> i32 {
+    use ide_host::web::{self, WebConfig};
+    let (config_dir, data_dir) = (base.join("config"), base.join("data"));
+    for dir in [&config_dir, &data_dir] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("cannot create {}: {e}", dir.display());
+            return 1;
+        }
+    }
+    let languages = match LanguageRegistry::load(Some(&config_dir.join("languages"))) {
+        Ok(l) => Arc::new(l),
+        Err(e) => {
+            eprintln!("language definitions: {e}");
+            return 1;
+        }
+    };
+    let project = match options.project.as_deref().map(dunce::canonicalize).transpose() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("--project: {e}");
+            return 1;
+        }
+    };
+    if let Some(project) = &project
+        && !project.is_dir()
+    {
+        eprintln!("--project: {} is not a directory", project.display());
+        return 1;
+    }
+    let listener = match tokio::net::TcpListener::bind(&options.addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot listen on {}: {e}", options.addr);
+            return 1;
+        }
+    };
+    let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or(options.addr.clone());
+    match &options.token {
+        Some(token) => eprintln!("OpenIDEA is ready: http://{bound}/?token={token}"),
+        None => {
+            eprintln!(
+                "OpenIDEA is ready: http://{bound}/ (no access token: anyone who can reach this port can run code)"
+            )
+        }
+    }
+    let shared = Arc::new((base, languages, project));
+    let session: web::SessionFn = Arc::new(move |stream| {
+        let shared = shared.clone();
+        Box::pin(async move { web_session(&shared.0, shared.1.clone(), shared.2.clone(), stream).await })
+    });
+    let config = Arc::new(WebConfig { web_root: options.web_root, token: options.token });
+    tokio::select! {
+        () = web::serve(listener, config, session) => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    0
+}
+
+/// One browser tab: its own host, served until the socket closes.
+async fn web_session(
+    base: &std::path::Path,
+    languages: Arc<LanguageRegistry>,
+    project: Option<PathBuf>,
+    stream: tokio::io::DuplexStream,
+) {
+    let (config_dir, data_dir) = (base.join("config"), base.join("data"));
+    let peer = Arc::new(OnceLock::new());
+    let sink_peer = peer.clone();
+    let host = Arc::new(Host::new(HostConfig {
+        config_dir,
+        local_data_dir: data_dir.clone(),
+        data_dir,
+        languages,
+        syntax: Arc::default(),
+        sink_for: Box::new(move |window| rpc::event_sink(sink_peer.clone(), Some(window.to_owned()))),
+        owner: |w| w,
+        runtime: tokio::runtime::Handle::current(),
+        project_environment: true,
+    }));
+    if let Some(root) = &project
+        && let Err(e) = host.trust.inherit(root)
+    {
+        tracing::warn!("cannot trust {}: {e}", root.display());
+    }
+    let mut dispatcher = Dispatcher::standard();
+    ide_host::web::register_commands(&mut dispatcher);
+    // The folder the server was started for: the page opens it like a desktop window opens its own.
+    dispatcher.add("web_launch", TrustClass::Always, move |_| {
+        let project = project.clone();
+        async move { Ok(serde_json::json!({ "project": project })) }
+    });
+    let (reader, writer) = tokio::io::split(stream);
+    rpc::serve_framed(host.clone(), dispatcher, peer, reader, writer, ide_jsonrpc::Framing::Lines).await;
+    if tokio::time::timeout(std::time::Duration::from_secs(10), host.shutdown()).await.is_err() {
+        tracing::warn!("language servers did not shut down in time");
+    }
 }
 
 fn server_home() -> PathBuf {
